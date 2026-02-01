@@ -1,18 +1,23 @@
 import sys
 import subprocess
+import os  # <<< 新增：用于读取文件系统
 
 from starlette.status import HTTP_303_SEE_OTHER
 from starlette.applications import Starlette
 from starlette.config import Config
 from starlette.responses import JSONResponse, RedirectResponse
-from starlette.routing import Route
+from starlette.routing import Route, Mount  # <<< 修改：引入 Mount 用于挂载静态目录
 from starlette.templating import Jinja2Templates
 from starlette.background import BackgroundTask
+from starlette.staticfiles import StaticFiles # <<< 新增：用于提供文件下载服务
 
 from yt_dlp import YoutubeDL, version
 
 templates = Jinja2Templates(directory="templates")
 config = Config(".env")
+
+# 这里定义容器内的下载目录，和 Dockerfile/docker-compose 的挂载路径保持一致
+DOWNLOAD_DIR = "/youtube-dl" 
 
 app_defaults = {
     "YDL_FORMAT": config("YDL_FORMAT", cast=str, default="bestvideo+bestaudio/best"),
@@ -24,7 +29,7 @@ app_defaults = {
     "YDL_OUTPUT_TEMPLATE": config(
         "YDL_OUTPUT_TEMPLATE",
         cast=str,
-        default="/youtube-dl/%(title).200s [%(id)s].%(ext)s",
+        default=f"{DOWNLOAD_DIR}/%(title).200s [%(id)s].%(ext)s",
     ),
     "YDL_ARCHIVE_FILE": config("YDL_ARCHIVE_FILE", default=None),
     "YDL_UPDATE_TIME": config("YDL_UPDATE_TIME", cast=bool, default=True),
@@ -32,8 +37,28 @@ app_defaults = {
 
 
 async def dl_queue_list(request):
+    # <<< 新增开始：获取文件列表逻辑
+    files = []
+    try:
+        # 获取目录下所有文件
+        with os.scandir(DOWNLOAD_DIR) as entries:
+            # 过滤掉隐藏文件，按修改时间倒序排列（最新的在最上面）
+            files = sorted(
+                [entry.name for entry in entries if entry.is_file() and not entry.name.startswith('.')],
+                key=lambda x: os.path.getmtime(os.path.join(DOWNLOAD_DIR, x)),
+                reverse=True
+            )
+    except FileNotFoundError:
+        files = []
+    # <<< 新增结束
+
     return templates.TemplateResponse(
-        "index.html", {"request": request, "ytdlp_version": version.__version__}
+        "index.html", 
+        {
+            "request": request, 
+            "ytdlp_version": version.__version__,
+            "files": files  # <<< 修改：将文件列表传递给前端
+        }
     )
 
 
@@ -137,6 +162,8 @@ routes = [
     Route("/youtube-dl", endpoint=dl_queue_list),
     Route("/youtube-dl/q", endpoint=q_put, methods=["POST"]),
     Route("/youtube-dl/update", endpoint=update_route, methods=["PUT"]),
+    # <<< 新增：挂载静态文件目录，这样你点击文件名就可以直接下载
+    Mount("/downloads", app=StaticFiles(directory=DOWNLOAD_DIR), name="downloads"),
 ]
 
 app = Starlette(debug=True, routes=routes)

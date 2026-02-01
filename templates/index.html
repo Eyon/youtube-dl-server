@@ -79,6 +79,21 @@
             </button>
           </div>
         </form>
+
+                <hr class="my-4">
+        <h2 class="h4">Downloads</h2>
+        <div class="list-group text-start text-dark">
+            {% if files %}
+                {% for file in files %}
+                <a href="/downloads/{{ file }}" class="list-group-item list-group-item-action d-flex justify-content-between align-items-center" target="_blank">
+                    <span class="text-truncate" style="max-width: 90%;">{{ file }}</span>
+                    <span class="badge bg-primary rounded-pill">Download</span>
+                </a>
+                {% endfor %}
+            {% else %}
+                <div class="list-group-item text-muted">No files found (or directory empty).</div>
+            {% endif %}
+        </div>
       </main>
       <footer class="mt-auto text-muted">
         <div id="liveAlertPlaceholder"></div>
