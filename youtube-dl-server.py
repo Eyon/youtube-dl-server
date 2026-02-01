@@ -1,172 +1,175 @@
 import sys
 import subprocess
-import os  # <<< 新增：用于读取文件系统
-
+import os
+import uuid
+import httpx  # 用于发送 Webhook 通知
 from starlette.status import HTTP_303_SEE_OTHER
 from starlette.applications import Starlette
 from starlette.config import Config
 from starlette.responses import JSONResponse, RedirectResponse
-from starlette.routing import Route, Mount  # <<< 修改：引入 Mount 用于挂载静态目录
+from starlette.routing import Route, Mount
 from starlette.templating import Jinja2Templates
 from starlette.background import BackgroundTask
-from starlette.staticfiles import StaticFiles # <<< 新增：用于提供文件下载服务
+from starlette.staticfiles import StaticFiles
 
 from yt_dlp import YoutubeDL, version
 
+# 配置
 templates = Jinja2Templates(directory="templates")
 config = Config(".env")
 
-# 这里定义容器内的下载目录，和 Dockerfile/docker-compose 的挂载路径保持一致
-DOWNLOAD_DIR = "/youtube-dl" 
+# 容器内固定的下载目录
+DOWNLOAD_DIR = "/youtube-dl"
 
 app_defaults = {
     "YDL_FORMAT": config("YDL_FORMAT", cast=str, default="bestvideo+bestaudio/best"),
     "YDL_EXTRACT_AUDIO_FORMAT": config("YDL_EXTRACT_AUDIO_FORMAT", default=None),
-    "YDL_EXTRACT_AUDIO_QUALITY": config(
-        "YDL_EXTRACT_AUDIO_QUALITY", cast=str, default="192"
-    ),
+    "YDL_EXTRACT_AUDIO_QUALITY": config("YDL_EXTRACT_AUDIO_QUALITY", cast=str, default="192"),
     "YDL_RECODE_VIDEO_FORMAT": config("YDL_RECODE_VIDEO_FORMAT", default=None),
-    "YDL_OUTPUT_TEMPLATE": config(
-        "YDL_OUTPUT_TEMPLATE",
-        cast=str,
-        default=f"{DOWNLOAD_DIR}/%(title).200s [%(id)s].%(ext)s",
-    ),
+    "YDL_OUTPUT_TEMPLATE": config("YDL_OUTPUT_TEMPLATE", cast=str, default=f"{DOWNLOAD_DIR}/%(title).200s [%(id)s].%(ext)s"),
     "YDL_ARCHIVE_FILE": config("YDL_ARCHIVE_FILE", default=None),
     "YDL_UPDATE_TIME": config("YDL_UPDATE_TIME", cast=bool, default=True),
 }
 
+# --- 逻辑函数 ---
 
-async def dl_queue_list(request):
-    # <<< 新增开始：获取文件列表逻辑
-    files = []
+def get_files():
+    """获取下载目录下的文件列表"""
     try:
-        # 获取目录下所有文件
         with os.scandir(DOWNLOAD_DIR) as entries:
-            # 过滤掉隐藏文件，按修改时间倒序排列（最新的在最上面）
-            files = sorted(
+            return sorted(
                 [entry.name for entry in entries if entry.is_file() and not entry.name.startswith('.')],
                 key=lambda x: os.path.getmtime(os.path.join(DOWNLOAD_DIR, x)),
                 reverse=True
             )
-    except FileNotFoundError:
-        files = []
-    # <<< 新增结束
+    except Exception:
+        return []
 
+def download_worker(url, output_path, webhook_url, job_id):
+    """后台下载任务核心逻辑"""
+    # 强制指定格式和输出路径
+    ydl_opts = {
+        "format": "bestvideo[ext=mp4]+bestaudio[ext=m4a]/best[ext=mp4]/best",
+        "outtmpl": output_path,
+        "noplaylist": True,
+        "merge_output_format": "mp4"
+    }
+
+    status = "success"
+    error_msg = None
+
+    try:
+        print(f"Starting download job {job_id} for URL: {url}")
+        with YoutubeDL(ydl_opts) as ydl:
+            ydl.download([url])
+        print(f"Job {job_id} completed successfully.")
+    except Exception as e:
+        status = "failed"
+        error_msg = str(e)
+        print(f"Job {job_id} failed: {error_msg}")
+
+    # 发送 Webhook 通知
+    if webhook_url:
+        payload = {
+            "job_id": job_id,
+            "url": url,
+            "status": status,
+            "filename": os.path.basename(output_path),
+            "download_url": f"/downloads/{os.path.basename(output_path)}",
+            "error": error_msg
+        }
+        try:
+            with httpx.Client() as client:
+                client.post(webhook_url, json=payload, timeout=10.0)
+                print(f"Webhook sent to {webhook_url}")
+        except Exception as we:
+            print(f"Failed to send webhook for {job_id}: {we}")
+
+# --- 路由处理函数 ---
+
+async def dl_queue_list(request):
+    """Web 页面展示"""
+    added = request.query_params.get("added")
     return templates.TemplateResponse(
         "index.html", 
         {
             "request": request, 
             "ytdlp_version": version.__version__,
-            "files": files  # <<< 修改：将文件列表传递给前端
+            "files": get_files(),
+            "added": added
         }
     )
 
+async def api_download(request):
+    """新增的 JSON API 接口"""
+    try:
+        data = await request.json()
+    except Exception:
+        return JSONResponse({"success": False, "error": "Invalid JSON body"}, status_code=400)
 
-async def redirect(request):
-    return RedirectResponse(url="/youtube-dl")
+    url = data.get("url")
+    webhook = data.get("webhook")
+    
+    if not url:
+        return JSONResponse({"success": False, "error": "Missing 'url' parameter"}, status_code=400)
 
+    # 生成 UUID 文件名
+    job_id = str(uuid.uuid4())
+    filename = f"{job_id}.mp4"
+    output_path = os.path.join(DOWNLOAD_DIR, filename)
+
+    # 启动后台任务
+    task = BackgroundTask(download_worker, url, output_path, webhook, job_id)
+
+    return JSONResponse({
+        "success": True,
+        "job_id": job_id,
+        "filename": filename,
+        "download_url": f"/downloads/{filename}"
+    }, background=task)
 
 async def q_put(request):
+    """兼容原有的 Web UI 提交"""
     form = await request.form()
     url = form.get("url").strip()
-    ui = form.get("ui")
-    options = {"format": form.get("format")}
-
     if not url:
-        return JSONResponse(
-            {"success": False, "error": "/q called without a 'url' in form data"}
-        )
+        return JSONResponse({"success": False, "error": "No URL provided"})
 
-    task = BackgroundTask(download, url, options)
-
-    print("Added url " + url + " to the download queue")
-
-    if not ui:
-        return JSONResponse(
-            {"success": True, "url": url, "options": options}, background=task
-        )
+    job_id = str(uuid.uuid4())
+    output_path = os.path.join(DOWNLOAD_DIR, f"{job_id}.mp4")
+    
+    task = BackgroundTask(download_worker, url, output_path, None, job_id)
     return RedirectResponse(
         url="/youtube-dl?added=" + url, status_code=HTTP_303_SEE_OTHER, background=task
     )
 
-
-async def update_route(scope, receive, send):
-    task = BackgroundTask(update)
-
-    return JSONResponse({"output": "Initiated package update"}, background=task)
-
+async def redirect(request):
+    return RedirectResponse(url="/youtube-dl")
 
 def update():
     try:
-        output = subprocess.check_output(
-            [sys.executable, "-m", "pip", "install", "--upgrade", "yt-dlp"]
-        )
+        subprocess.check_output([sys.executable, "-m", "pip", "install", "--upgrade", "yt-dlp"])
+    except Exception as e:
+        print(f"Update failed: {e}")
 
-        print(output.decode("utf-8"))
-    except subprocess.CalledProcessError as e:
-        print(e.output)
+async def update_route(scope, receive, send):
+    task = BackgroundTask(update)
+    return JSONResponse({"output": "Initiated package update"}, background=task)
 
-
-def get_ydl_options(request_options):
-    request_vars = {
-        "YDL_EXTRACT_AUDIO_FORMAT": None,
-        "YDL_RECODE_VIDEO_FORMAT": None,
-    }
-
-    requested_format = request_options.get("format", "bestvideo")
-
-    if requested_format in ["aac", "flac", "mp3", "m4a", "opus", "vorbis", "wav"]:
-        request_vars["YDL_EXTRACT_AUDIO_FORMAT"] = requested_format
-    elif requested_format == "bestaudio":
-        request_vars["YDL_EXTRACT_AUDIO_FORMAT"] = "best"
-    elif requested_format in ["mp4", "flv", "webm", "ogg", "mkv", "avi"]:
-        request_vars["YDL_RECODE_VIDEO_FORMAT"] = requested_format
-
-    ydl_vars = app_defaults | request_vars
-
-    postprocessors = []
-
-    if ydl_vars["YDL_EXTRACT_AUDIO_FORMAT"]:
-        postprocessors.append(
-            {
-                "key": "FFmpegExtractAudio",
-                "preferredcodec": ydl_vars["YDL_EXTRACT_AUDIO_FORMAT"],
-                "preferredquality": ydl_vars["YDL_EXTRACT_AUDIO_QUALITY"],
-            }
-        )
-
-    if ydl_vars["YDL_RECODE_VIDEO_FORMAT"]:
-        postprocessors.append(
-            {
-                "key": "FFmpegVideoConvertor",
-                "preferedformat": ydl_vars["YDL_RECODE_VIDEO_FORMAT"],
-            }
-        )
-
-    return {
-        "format": ydl_vars["YDL_FORMAT"],
-        "postprocessors": postprocessors,
-        "outtmpl": ydl_vars["YDL_OUTPUT_TEMPLATE"],
-        "download_archive": ydl_vars["YDL_ARCHIVE_FILE"],
-        "updatetime": ydl_vars["YDL_UPDATE_TIME"] == "True",
-    }
-
-
-def download(url, request_options):
-    with YoutubeDL(get_ydl_options(request_options)) as ydl:
-        ydl.download([url])
-
+# --- 应用初始化 ---
 
 routes = [
     Route("/", endpoint=redirect),
     Route("/youtube-dl", endpoint=dl_queue_list),
     Route("/youtube-dl/q", endpoint=q_put, methods=["POST"]),
     Route("/youtube-dl/update", endpoint=update_route, methods=["PUT"]),
-    # <<< 新增：挂载静态文件目录，这样你点击文件名就可以直接下载
+    # API 接口
+    Route("/api/download", endpoint=api_download, methods=["POST"]),
+    # 静态文件访问接口 (下载最终文件)
     Mount("/downloads", app=StaticFiles(directory=DOWNLOAD_DIR), name="downloads"),
 ]
 
 app = Starlette(debug=True, routes=routes)
 
-print("Updating youtube-dl to the newest version")
+print("Updating yt-dlp to the newest version...")
 update()
