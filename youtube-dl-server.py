@@ -3,28 +3,36 @@ import subprocess
 import os
 import uuid
 import httpx
-from starlette.status import HTTP_303_SEE_OTHER
+from starlette.status import HTTP_401_UNAUTHORIZED
 from starlette.applications import Starlette
 from starlette.config import Config
-from starlette.responses import JSONResponse, RedirectResponse
+from starlette.responses import JSONResponse, Response
 from starlette.routing import Route, Mount
-from starlette.templating import Jinja2Templates
 from starlette.background import BackgroundTask
 from starlette.staticfiles import StaticFiles
 
 from yt_dlp import YoutubeDL, version
 
 # 配置
-templates = Jinja2Templates(directory="templates")
 config = Config(".env")
 DOWNLOAD_DIR = "/youtube-dl"
 
-# 用于存储任务状态的内存字典 (实际生产环境建议用 Redis)
-# 格式: {"job_id": {"status": "pending/downloading/completed/failed", "filename": "xxx.mp4", "error": ""}}
+# --- 权限配置 ---
+# 默认 Token：xt_8f2d9e1a5b6c4d7e3a2f1b9c8d7e6a5b
+API_TOKEN = config("API_TOKEN", cast=str, default="xt_8f2d9e1a5b6c4d7e3a2f1b9c8d7e6a5b")
+
+def check_auth(request):
+    """校验 API Token"""
+    auth_header = request.headers.get("Authorization")
+    if not auth_header or auth_header != f"Bearer {API_TOKEN}":
+        return False
+    return True
+
+# 任务状态存储
 jobs_status = {}
 
 def download_worker(url, output_path, webhook_url, job_id):
-    """后台下载任务核心逻辑"""
+    """后台下载任务"""
     jobs_status[job_id]["status"] = "downloading"
     
     ydl_opts = {
@@ -32,88 +40,117 @@ def download_worker(url, output_path, webhook_url, job_id):
         "outtmpl": output_path,
         "noplaylist": True,
         "merge_output_format": "mp4",
-        "quiet": True
+        "quiet": True,
+        "no_warnings": True
     }
 
     try:
         with YoutubeDL(ydl_opts) as ydl:
             ydl.download([url])
         jobs_status[job_id]["status"] = "completed"
-        print(f"Job {job_id} completed.")
+        print(f"[SUCCESS] Job {job_id} done.")
     except Exception as e:
         jobs_status[job_id]["status"] = "failed"
         jobs_status[job_id]["error"] = str(e)
-        print(f"Job {job_id} failed: {e}")
+        print(f"[ERROR] Job {job_id} failed: {e}")
 
-    # 保留 Webhook 功能 (可选)
+    # Webhook 通知
     if webhook_url:
         try:
             with httpx.Client() as client:
-                client.post(webhook_url, json={"job_id": job_id, "status": jobs_status[job_id]["status"]}, timeout=5.0)
-        except: pass
+                client.post(webhook_url, json={
+                    "job_id": job_id, 
+                    "status": jobs_status[job_id]["status"],
+                    "filename": jobs_status[job_id]["filename"],
+                    "download_url": f"/downloads/{jobs_status[job_id]['filename']}" if jobs_status[job_id]["status"] == "completed" else None
+                }, timeout=5.0)
+        except:
+            pass
 
-# --- API 路由 ---
+# --- API 接口 ---
 
 async def api_download(request):
-    """请求下载"""
+    """触发下载 API"""
+    if not check_auth(request):
+        return JSONResponse({"error": "Unauthorized"}, status_code=401)
+
     try:
         data = await request.json()
     except:
-        return JSONResponse({"success": False, "error": "Invalid JSON"}, status_code=400)
+        return JSONResponse({"error": "Invalid JSON"}, status_code=400)
 
     url = data.get("url")
     if not url:
-        return JSONResponse({"success": False, "error": "Missing url"}, status_code=400)
+        return JSONResponse({"error": "Missing url"}, status_code=400)
 
     job_id = str(uuid.uuid4())
     filename = f"{job_id}.mp4"
     output_path = os.path.join(DOWNLOAD_DIR, filename)
 
-    # 初始化状态
-    jobs_status[job_id] = {"status": "pending", "filename": filename, "error": None}
+    # 初始化任务状态
+    jobs_status[job_id] = {
+        "status": "pending",
+        "filename": filename,
+        "error": None
+    }
 
     task = BackgroundTask(download_worker, url, output_path, data.get("webhook"), job_id)
-    return JSONResponse({"success": True, "job_id": job_id, "filename": filename}, background=task)
+    return JSONResponse({
+        "success": True, 
+        "job_id": job_id,
+        "filename": filename
+    }, background=task)
 
 async def api_status(request):
-    """查询下载状态 (iOS 轮询此接口)"""
+    """查询状态 API"""
+    if not check_auth(request):
+        return JSONResponse({"error": "Unauthorized"}, status_code=401)
+
     job_id = request.path_params.get("job_id")
     status_info = jobs_status.get(job_id)
     
     if not status_info:
-        return JSONResponse({"success": False, "error": "Job not found"}, status_code=404)
+        return JSONResponse({"error": "Job not found"}, status_code=404)
     
-    # 构造下载直链
+    # 构建完整响应
+    response_data = {
+        "job_id": job_id,
+        "status": status_info["status"],
+        "filename": status_info["filename"],
+        "error": status_info["error"]
+    }
+    
     if status_info["status"] == "completed":
-        status_info["download_url"] = f"/downloads/{status_info['filename']}"
+        response_data["download_url"] = f"/downloads/{status_info['filename']}"
     
-    return JSONResponse(status_info)
+    return JSONResponse(response_data)
 
-# --- 原有 Web UI 路由 (略作修改以兼容) ---
-async def dl_queue_list(request):
-    files = []
-    try:
-        with os.scandir(DOWNLOAD_DIR) as entries:
-            files = sorted([e.name for e in entries if e.is_file() and not e.name.startswith('.')],
-                           key=lambda x: os.path.getmtime(os.path.join(DOWNLOAD_DIR, x)), reverse=True)
-    except: pass
-    return templates.TemplateResponse("index.html", {"request": request, "ytdlp_version": version.__version__, "files": files})
+async def home(request):
+    """根路径：仅作为运行状态展示，不提供 UI"""
+    return JSONResponse({
+        "service": "youtube-dl-api",
+        "status": "running",
+        "version": version.__version__
+    })
 
-async def q_put(request):
-    form = await request.form()
-    url = form.get("url").strip()
-    job_id = str(uuid.uuid4())
-    jobs_status[job_id] = {"status": "pending", "filename": f"{job_id}.mp4"}
-    task = BackgroundTask(download_worker, url, os.path.join(DOWNLOAD_DIR, f"{job_id}.mp4"), None, job_id)
-    return RedirectResponse(url="/youtube-dl?added=" + url, status_code=HTTP_303_SEE_OTHER, background=task)
+# --- 路由配置 ---
 
 routes = [
-    Route("/", endpoint=lambda r: RedirectResponse("/youtube-dl")),
-    Route("/youtube-dl", endpoint=dl_queue_list),
-    Route("/youtube-dl/q", endpoint=q_put, methods=["POST"]),
+    Route("/", endpoint=home),
     Route("/api/download", endpoint=api_download, methods=["POST"]),
-    Route("/api/status/{job_id}", endpoint=api_status, methods=["GET"]), # 新增：状态查询
+    Route("/api/status/{job_id}", endpoint=api_status, methods=["GET"]),
+    # 静态文件下载（这个不需要 Token，因为 UUID 已经是天然的屏障）
     Mount("/downloads", app=StaticFiles(directory=DOWNLOAD_DIR), name="downloads"),
 ]
 
-app = Starlette(debug=True, routes=routes)
+app = Starlette(debug=False, routes=routes)
+
+# 启动自动更新 yt-dlp
+def update():
+    try:
+        subprocess.check_output([sys.executable, "-m", "pip", "install", "--upgrade", "yt-dlp"])
+        print("yt-dlp updated.")
+    except:
+        pass
+
+update()
